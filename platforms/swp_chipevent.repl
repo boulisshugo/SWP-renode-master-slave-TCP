@@ -1,0 +1,9 @@
+// The same link, driven by ChipEventController opcodes on port 3456:
+//   0x07 -> ACTIVATE, 0x08 -> DEACTIVATE
+// Raw link data still goes over the controller's own port 3460.
+
+using "platforms/swp_link.repl"
+
+chipEvents: SWP.SWPChipEventController @ sysbus
+    controller: swp
+    controlPort: 3456

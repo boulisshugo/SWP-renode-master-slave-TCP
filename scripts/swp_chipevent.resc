@@ -1,0 +1,21 @@
+:name: SWP link driven by ChipEventController
+:description: The SWP link with a ChipEventController in front of it, so opcode
+:description: 0x07 activates the link and 0x08 deactivates it, each acknowledged
+:description: only once the transition has actually completed in virtual time.
+
+using sysbus
+mach create "board"
+
+include @peripherals/SWP.cs
+include @peripherals/SWPController.cs
+include @peripherals/SWPSlave.cs
+include @peripherals/ChipEventController.cs
+include @peripherals/SWPChipEventController.cs
+
+machine LoadPlatformDescription @platforms/swp_chipevent.repl
+
+echo ""
+echo "SWP link ready."
+echo "  chip events:    tcp://127.0.0.1:3456   (0x07 activate, 0x08 deactivate)"
+echo "  raw link data:  tcp://127.0.0.1:3460"
+echo ""

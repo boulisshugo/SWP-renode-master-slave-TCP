@@ -1,0 +1,25 @@
+// A bare SWP link: one controller (CLF), one slave (UICC), nothing else.
+//
+// Point-to-point by construction — the controller accepts exactly one slave,
+// which is what the wire allows.
+
+swp: SWP.SWPController @ sysbus
+    port: 3460
+    // ETSI TS 102 613 link-management timings, in microseconds. These are the
+    // model's defaults spelled out; override any of them for your part.
+    P1: 1000     // idle window in ACTIVATED before the master may SUSPEND
+    P2: 100      // idle bits after the resume transition sequence
+    P3: 500      // P3max: slave must answer a RESUME inside this
+    P4: 1000     // SWIO held low for longer than this -> DEACTIVATED
+    P5: 1000     // ACTIVATE: line settling before the slave is addressed
+    P6: 10000    // ACTIVATE: slave must answer inside this, measured from P5
+    P7: 20000    // ACTIVATE: overall budget for the whole sequence
+
+uicc: SWP.SWPSlave @ swp
+    P1: 1000
+    P2: 100
+    P3: 500
+    P4: 1000
+    P5: 1000
+    P6: 10000
+    P7: 20000

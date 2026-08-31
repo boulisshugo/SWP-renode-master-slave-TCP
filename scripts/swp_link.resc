@@ -1,0 +1,24 @@
+:name: SWP master-slave link
+:description: A bare ETSI TS 102 613 SWP link — one controller (CLF) with a raw
+:description: TCP socket, one slave (UICC) — with no CPU and no firmware.
+
+$repl ?= @platforms/swp_link.repl
+
+using sysbus
+mach create "board"
+
+# The peripherals are plain C# and are compiled by the Monitor at load time, so
+# this works against a stock Renode with nothing built into the tree.
+include @peripherals/SWP.cs
+include @peripherals/SWPController.cs
+include @peripherals/SWPSlave.cs
+
+machine LoadPlatformDescription $repl
+
+echo ""
+echo "SWP link ready."
+echo "  raw link data:  tcp://127.0.0.1:3460   (bytes in -> slave, slave bytes -> out)"
+echo ""
+echo "  swp Activate / swp Suspend / swp Resume / swp Deactivate"
+echo "  swp Status ; uicc Status ; uicc LastReceived"
+echo ""
