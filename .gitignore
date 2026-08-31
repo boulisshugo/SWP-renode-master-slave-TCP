@@ -1,2 +1,4 @@
 output/
 *.user
+firmware/build/
+tools/java-client/out/

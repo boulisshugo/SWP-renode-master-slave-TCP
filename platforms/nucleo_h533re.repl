@@ -1,0 +1,79 @@
+// NUCLEO-H533RE — STM32H533RE (Cortex-M33), reduced to what the SWP example
+// needs: a CPU, memory, the console USART the ST-LINK VCP is wired to, and the
+// SWP link itself.
+//
+// The link peripherals are platform-independent; only swpmi (the register
+// front-end) and its address are specific to this part. On real silicon the
+// STM32H5's block at 0x40008800 is SWPMI, a Single Wire Protocol *Master*
+// Interface; this example instead fronts the slave end from firmware, so the
+// board plays the UICC and a host TCP client plays the CLF. Point `slave:` at
+// `swp` instead and the roles swap, with no change to the link model.
+
+nvic: IRQControllers.NVIC @ sysbus 0xE000E000
+    priorityMask: 0xF0
+    systickFrequency: 250000000
+    IRQ -> cpu@0
+
+cpu: CPU.CortexM @ sysbus
+    cpuType: "cortex-m33"
+    nvic: nvic
+
+// STM32H533RE: 256 KB flash, 272 KB SRAM.
+flash: Memory.MappedMemory @ sysbus 0x08000000
+    size: 0x40000
+
+// Aliased at 0 so the boot vector table is where the CPU looks for it.
+flash_alias: Memory.MappedMemory @ sysbus 0x00000000
+    size: 0x40000
+
+sram1: Memory.MappedMemory @ sysbus 0x20000000
+    size: 0x44000
+
+// USART3 is the ST-LINK virtual COM port on a NUCLEO-H533RE.
+usart3: UART.STM32F7_USART @ sysbus 0x40004800
+    frequency: 250000000
+    IRQ -> nvic@60
+
+// ---- the SWP link -------------------------------------------------------
+//
+// Raw link data on tcp://127.0.0.1:3460 — whatever a host client writes there
+// is transmitted to the slave, and whatever the slave modulates back is
+// written out. Framing belongs to that client and to the firmware, not here.
+
+swp: SWP.SWPController @ sysbus
+    port: 3460
+    P1: 20000    // idle window in ACTIVATED before the master may SUSPEND
+    P2: 2000     // idle bits after the resume transition sequence
+    P3: 500      // P3max: the slave must answer a RESUME inside this
+    P4: 1000     // SWIO held low longer than this -> DEACTIVATED
+    P5: 1000     // ACTIVATE: line settling before the slave is addressed
+    P6: 10000    // ACTIVATE: the slave must answer inside this
+    P7: 20000    // ACTIVATE: overall budget for the sequence
+
+uicc: SWP.SWPSlave @ swp
+    P1: 20000
+    P2: 2000
+    P3: 500
+    P4: 1000
+    P5: 1000
+    P6: 10000
+    P7: 20000
+
+// Link events over TCP: opcode 0x07 activates the link, 0x08 deactivates it,
+// each acknowledged only once the transition has completed in virtual time.
+// This is what lets a host client drive the whole demo without the Monitor.
+chipEvents: SWP.SWPChipEventController @ sysbus
+    controller: swp
+    controlPort: 3456
+
+// Firmware's window onto the link, at the SWPMI address of this part.
+swpmi: SWP.SWPRegisterInterface @ sysbus 0x40008800
+    slave: uicc
+    IRQ -> nvic@103
+
+sysbus:
+    init:
+        Tag <0x40021000, 0x400213FF> "RCC"
+        Tag <0x44020000, 0x440203FF> "GPIOA"
+        Tag <0x42020400, 0x420207FF> "GPIOB"
+        Tag <0x58024800, 0x58024BFF> "PWR"

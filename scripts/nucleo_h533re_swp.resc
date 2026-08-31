@@ -1,0 +1,36 @@
+:name: NUCLEO-H533RE SWP slave demo
+:description: An STM32H533RE playing the UICC end of an SWP link. A host TCP
+:description: client on port 3460 is the CLF: it activates the link and sends
+:description: raw bytes; the firmware frames and answers them.
+
+$bin ?= @firmware/build/swp-demo.elf
+
+using sysbus
+mach create "nucleo_h533re"
+
+include @peripherals/SWP.cs
+include @peripherals/SWPController.cs
+include @peripherals/SWPSlave.cs
+include @peripherals/SWPRegisterInterface.cs
+include @peripherals/ChipEventController.cs
+include @peripherals/SWPChipEventController.cs
+
+machine LoadPlatformDescription @platforms/nucleo_h533re.repl
+
+showAnalyzer sysbus.usart3
+
+macro reset
+"""
+    sysbus LoadELF $bin
+"""
+runMacro $reset
+
+echo ""
+echo "NUCLEO-H533RE ready. The board is the UICC; you are the CLF."
+echo "  raw link data:  tcp://127.0.0.1:3460"
+echo "  link events:    tcp://127.0.0.1:3456   (0x07 activate, 0x08 deactivate)"
+echo "  console:        sysbus.usart3"
+echo ""
+echo "  sysbus.swp Activate        bring the link up"
+echo "  sysbus.swp Status          link state, timings, byte counters"
+echo ""

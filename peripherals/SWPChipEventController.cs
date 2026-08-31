@@ -12,13 +12,18 @@
 //   PowerUpSWP   (opcode 0x07) -> ACTIVATE   the link
 //   PowerDownSWP (opcode 0x08) -> DEACTIVATE the link
 //
-// The one piece of glue that matters is SWPTimer.Scheduler. Left alone, the
-// controller posts its P-delays straight onto the clock source, and the
-// ChipEventController would acknowledge 0x07 the instant Activate() returned —
-// long before the link was actually up. Pointing the controller's timer at the
-// base class's DelayedSequencer instead puts every SWP delay on the same queue
-// the acknowledgement handshake watches, so the client's reply arrives only
-// once the link has genuinely reached ACTIVATED (or the activation has failed).
+// The glue that matters is how the acknowledgement is held back. Activate()
+// returns immediately — it only arms P5, P6 and P7 — so acknowledging when it
+// returns would tell the client the link was up long before it was. The fix is
+// a settle-watch: a step that re-posts itself on the base class's
+// DelayedSequencer while the transition is still in flight. The sequencer stays
+// Busy for as long as it keeps re-posting, which is exactly the condition the
+// base class's ticket handshake waits on, so the client's reply lands when the
+// link has genuinely settled.
+//
+// What must NOT be done is routing the controller's own P-delays onto that
+// sequencer. Those are concurrent deadlines, not a sequence: a serial queue
+// would run the P7 guard before the P5 step and fail every activation.
 //
 // This class is chip-agnostic; SupportsInterface reports SWP only. A real chip
 // with more interfaces should subclass it, or copy the four lines of glue in
@@ -63,12 +68,6 @@ namespace Antmicro.Renode.Peripherals.SWP
             }
             this.controller = controller;
 
-            // The glue. Every P1..P7 delay the controller schedules now lands on
-            // the base class's sequencer, which is what the acknowledgement
-            // handshake watches - so a client's 0x07 is answered when the link
-            // is up, not when Activate() returned.
-            controller.Timer.Scheduler = (delay, action) => Sequencer.Post(DelayedStep.After(delay, action));
-
             controller.StateChanged += OnLinkStateChanged;
             controller.ActivationFailed += OnActivationFailed;
         }
@@ -82,6 +81,11 @@ namespace Antmicro.Renode.Peripherals.SWP
             this.Log(LogLevel.Debug, "PowerUpSWP: activating the SWP link");
             lastActivationFailed = false;
             controller.Activate();
+
+            // P7 bounds the whole activation, so nothing can still be in flight
+            // a little past it.
+            HoldUntilSettled(() => controller.State == SWPState.Activated || lastActivationFailed,
+                controller.Timings.P7 + Margin);
         }
 
         /// <summary>Opcode 0x08. Acknowledged once the link has been held low for P4 and is DEACTIVATED.</summary>
@@ -89,6 +93,38 @@ namespace Antmicro.Renode.Peripherals.SWP
         {
             this.Log(LogLevel.Debug, "PowerDownSWP: deactivating the SWP link");
             controller.Deactivate();
+
+            HoldUntilSettled(() => controller.State == SWPState.Deactivated,
+                controller.Timings.P4 + Margin);
+        }
+
+        /// <summary>
+        /// Keep the base class's sequencer Busy — and so the client's
+        /// acknowledgement pending — until <paramref name="settled"/> is true or
+        /// the budget runs out. Each poll re-posts the next one, so an idle
+        /// watch costs nothing once the transition has resolved.
+        /// </summary>
+        private void HoldUntilSettled(Func<bool> settled, TimeInterval budget)
+        {
+            var remaining = budget;
+            Action poll = null;
+            poll = () =>
+            {
+                if(settled())
+                {
+                    return;
+                }
+                if(remaining <= PollInterval)
+                {
+                    this.Log(LogLevel.Warning,
+                        "Link did not settle within {0}us; acknowledging the client anyway",
+                        budget.TotalMicroseconds);
+                    return;
+                }
+                remaining -= PollInterval;
+                Sequencer.Post(DelayedStep.After(PollInterval, poll));
+            };
+            Sequencer.Post(DelayedStep.After(PollInterval, poll));
         }
 
         // --- extra Monitor verbs, beyond the two power opcodes ------------------
@@ -123,7 +159,6 @@ namespace Antmicro.Renode.Peripherals.SWP
         {
             controller.StateChanged -= OnLinkStateChanged;
             controller.ActivationFailed -= OnActivationFailed;
-            controller.Timer.Scheduler = null;
             base.Dispose();
         }
 
@@ -136,7 +171,21 @@ namespace Antmicro.Renode.Peripherals.SWP
         {
             lastActivationFailed = true;
             this.Log(LogLevel.Warning, "SWP activation failed; the link stays DEACTIVATED");
+
+            // The server optimistically marked SWP as powered when the handler
+            // returned. SWP is the only interface this class claims, so clearing
+            // the whole bitmask clears exactly that bit — and it happens while
+            // the settle-watch still holds the ticket, so the client's reply
+            // carries the corrected mask rather than a false success.
+            Server.ResetState();
         }
+
+        /// <summary>How often the settle-watch re-checks, in virtual time.</summary>
+        private static readonly TimeInterval PollInterval = TimeInterval.FromMicroseconds(200);
+
+        /// <summary>Slack past a transition's own budget, so a deadline landing
+        /// exactly on the boundary is not called a timeout.</summary>
+        private static readonly TimeInterval Margin = TimeInterval.FromMilliseconds(5);
 
         private readonly SWPController controller;
         private volatile bool lastActivationFailed;

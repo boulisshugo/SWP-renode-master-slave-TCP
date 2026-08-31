@@ -225,11 +225,13 @@ namespace Antmicro.Renode.Peripherals.SWP
     /// <summary>
     /// Delayed work on virtual time, with cancellation. Each endpoint owns one.
     ///
-    /// The scheduling call is indirected through <see cref="Scheduler"/> so a
-    /// host — such as a ChipEventController — can route SWP's delays onto its
-    /// own sequencer and have its client acknowledgement held back until the
-    /// whole ACTIVATE sequence has played out in virtual time. Left unset, it
-    /// falls back to <c>machine.ScheduleAction</c> and needs no host at all.
+    /// The steps posted here are independent deadlines running side by side,
+    /// not a sequence: an ACTIVATE arms P5, P6 and P7 at once and whichever
+    /// expires first decides the outcome. That is why this schedules straight
+    /// onto the clock source and offers no hook to redirect it — routing these
+    /// onto a serial queue would run P7 before P5 and fail every activation.
+    /// A host that wants to know when a transition has settled should watch
+    /// <see cref="SWPController.StateChanged"/> instead.
     /// </summary>
     public sealed class SWPTimer
     {
@@ -239,12 +241,6 @@ namespace Antmicro.Renode.Peripherals.SWP
             this.owner = owner;
             this.name = name;
         }
-
-        /// <summary>
-        /// Optional external sequencer: (delay, action). Set it and every SWP
-        /// delay is posted there instead of straight onto the clock source.
-        /// </summary>
-        public Action<TimeInterval, Action> Scheduler { get; set; }
 
         /// <summary>Run <paramref name="action"/> after <paramref name="delay"/> of virtual time.</summary>
         public void Schedule(TimeInterval delay, Action action)
@@ -269,12 +265,6 @@ namespace Antmicro.Renode.Peripherals.SWP
                 }
             };
 
-            var external = Scheduler;
-            if(external != null)
-            {
-                external(Clamp(delay), guarded);
-                return;
-            }
             machine.ScheduleAction(Clamp(delay), _ => guarded(), name);
         }
 
