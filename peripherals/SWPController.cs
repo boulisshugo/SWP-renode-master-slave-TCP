@@ -101,14 +101,6 @@ namespace Antmicro.Renode.Peripherals.SWP
         /// </summary>
         public bool AutoResumeOnTransmit { get; set; } = true;
 
-        /// <summary>
-        /// Cap on bytes queued towards the host client. Past it, data is
-        /// dropped and <see cref="Overruns"/> counts up, rather than letting an
-        /// unbounded queue grow while nobody is reading. Real hardware has a
-        /// FIFO and an overrun flag; this is the same idea.
-        /// </summary>
-        public int TransmitHighWaterMark { get; set; } = 1 << 20;
-
         // ==============================================================
         //  Link state
         // ==============================================================
@@ -638,7 +630,6 @@ namespace Antmicro.Renode.Peripherals.SWP
         private void OnClientConnected(Stream stream)
         {
             clientConnected = true;
-            Interlocked.Exchange(ref queuedToHost, 0);
             this.Log(LogLevel.Info, "Host client connected to the SWP controller on port {0}", port);
         }
 
@@ -666,7 +657,19 @@ namespace Antmicro.Renode.Peripherals.SWP
             Machine.HandleTimeDomainEvent<byte[]>(SendToSlave, copy, false);
         }
 
-        /// <summary>Emulation thread. Never blocks: full queue means drop and count.</summary>
+        /// <summary>
+        /// Emulation thread. Never blocks — Send only enqueues.
+        ///
+        /// The queue behind Send is unbounded, so the one case that would leak
+        /// for a whole simulation is a chatty link with nobody attached; that
+        /// is what the check below prevents, and it is the case that actually
+        /// happens. A peer that stays connected but stops reading still backs
+        /// up behind the writer thread, and there is no honest guard for that
+        /// from here: SocketServerProvider exposes no hook for when its writer
+        /// drains, so any byte counter kept on this side would be a guess
+        /// dressed up as backpressure. Dropped bytes are counted in
+        /// <see cref="Overruns"/> either way.
+        /// </summary>
         private void TransmitToHost(byte[] data)
         {
             var provider = socket;
@@ -681,19 +684,9 @@ namespace Antmicro.Renode.Peripherals.SWP
                 return;
             }
 
-            if(Interlocked.Add(ref queuedToHost, data.Length) > TransmitHighWaterMark)
-            {
-                Interlocked.Add(ref queuedToHost, -data.Length);
-                this.Log(LogLevel.Warning, "Host transmit queue above the high-water mark; dropping {0} byte(s)",
-                    data.Length);
-                Overruns++;
-                return;
-            }
-
             // One Send per burst — a SendByte loop would become one write() per
             // byte on the host side.
             provider.Send(data);
-            Interlocked.Add(ref queuedToHost, -data.Length);
         }
 
         // ==============================================================
@@ -808,7 +801,6 @@ namespace Antmicro.Renode.Peripherals.SWP
         private volatile ISWPSlave attachedSlave;
 
         private long activityCounter;
-        private int queuedToHost;
 
         [Transient]
         private SocketServerProvider socket;

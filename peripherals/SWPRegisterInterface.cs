@@ -51,6 +51,11 @@ namespace Antmicro.Renode.Peripherals.SWP
         /// <param name="controller">Front the master end. Mutually exclusive with <paramref name="slave"/>.</param>
         /// <param name="slave">Front the slave end. Mutually exclusive with <paramref name="controller"/>.</param>
         /// <param name="rxFifoDepth">Bytes buffered before OVR is raised.</param>
+        /// <remarks>
+        /// The <paramref name="machine"/> parameter is unused but kept: Renode
+        /// fills it in automatically when a peripheral is declared in a .repl,
+        /// and dropping it would change how this one has to be written there.
+        /// </remarks>
         public SWPRegisterInterface(IMachine machine, SWPController controller = null, SWPSlave slave = null,
             int rxFifoDepth = 256)
         {
@@ -60,7 +65,6 @@ namespace Antmicro.Renode.Peripherals.SWP
                     "SWPRegisterInterface fronts exactly one end of the link: pass either 'controller' or 'slave'");
             }
 
-            this.machine = machine;
             this.controller = controller;
             this.slave = slave;
             this.rxFifoDepth = Math.Max(1, rxFifoDepth);
@@ -248,6 +252,7 @@ namespace Antmicro.Renode.Peripherals.SWP
 
         private ulong PopReceived()
         {
+            byte value;
             lock(fifoLock)
             {
                 if(rxFifo.Count == 0)
@@ -255,10 +260,13 @@ namespace Antmicro.Renode.Peripherals.SWP
                     this.Log(LogLevel.Warning, "Read from RDR with an empty RX FIFO; returning 0");
                     return 0;
                 }
-                var value = rxFifo.Dequeue();
-                machine.LocalTimeSource.ExecuteInNearestSyncedState(___ => UpdateInterrupt());
-                return value;
+                value = rxFifo.Dequeue();
             }
+
+            // Outside the lock: draining the last byte clears RXNE, which can
+            // drop the IRQ line.
+            UpdateInterrupt();
+            return value;
         }
 
         private void UpdateInterrupt()
@@ -276,7 +284,6 @@ namespace Antmicro.Renode.Peripherals.SWP
             ReceiveLevel = 0x10,
         }
 
-        private readonly IMachine machine;
         private readonly SWPController controller;
         private readonly SWPSlave slave;
         private readonly int rxFifoDepth;
