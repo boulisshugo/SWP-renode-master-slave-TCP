@@ -18,6 +18,7 @@ using System.Text;
 using System.Threading;
 
 using Antmicro.Migrant;
+using Antmicro.Migrant.Hooks;
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure;
 using Antmicro.Renode.Exceptions;
@@ -29,13 +30,27 @@ using Antmicro.Renode.Utilities;
 namespace Antmicro.Renode.Peripherals.SWP
 {
     /// <summary>
-    /// A chip-agnostic SWP slave. Register it on a controller:
+    /// A chip-agnostic SWP slave, and the base class for proprietary ones.
+    /// Register it on a controller:
     ///
     ///     swp:  SWP.SWPController @ sysbus
     ///     uicc: SWP.SWPSlave @ swp
     ///
     /// Hook <see cref="DataReceived"/> to feed a firmware-facing peripheral, or
     /// give it a <c>port</c> to attach a second host client as the UICC end.
+    ///
+    /// EXTENDING THIS. Everything the master calls is virtual, and the seams a
+    /// subclass needs are protected: <see cref="Master"/> to answer on,
+    /// <see cref="SetState"/> to move this end's state, <see cref="Timer"/> to
+    /// schedule on virtual time, and <see cref="FlushPendingToMaster"/> to drain
+    /// what queued while the link was down. The pieces most derivatives replace
+    /// are <see cref="AnswerActivation"/> and <see cref="AnswerResume"/> — the
+    /// two points where a real part runs its own handshake — and
+    /// <see cref="ReceiveFromMaster"/>.
+    ///
+    /// Override, never hide. The controller holds this object as an
+    /// <see cref="ISWPSlave"/> and calls through the interface, so a `new`
+    /// method would compile, read correctly and never run. See integrate.md.
     /// </summary>
     public class SWPSlave : ISWPSlave, IDisposable
     {
@@ -93,13 +108,6 @@ namespace Antmicro.Renode.Peripherals.SWP
         public ulong ResumeResponseTimeMicroseconds { get; set; } = 50;
 
         /// <summary>
-        /// Echo every received burst straight back to the master. Off by
-        /// default — a real UICC answers with content, not a mirror — but it
-        /// makes a full round trip testable with no firmware at all.
-        /// </summary>
-        public bool Loopback { get; set; }
-
-        /// <summary>
         /// Keep received bursts in <see cref="ReceivedBursts"/> so a test can
         /// assert on them after the fact.
         /// </summary>
@@ -127,7 +135,7 @@ namespace Antmicro.Renode.Peripherals.SWP
         //  ISWPSlave — driven by the master
         // ==============================================================
 
-        public void AttachMaster(ISWPMaster master)
+        public virtual void AttachMaster(ISWPMaster master)
         {
             this.master = master;
             this.Log(LogLevel.Debug, "Attached to an SWP master");
@@ -137,28 +145,43 @@ namespace Antmicro.Renode.Peripherals.SWP
         /// The master has settled the line and is addressing us (end of P5).
         /// We must answer inside P6, and inside the master's overall P7.
         /// </summary>
-        public void OnActivate()
+        public virtual void OnActivate()
         {
             timer.CancelAll();
             this.Log(LogLevel.Debug, "ACTIVATE observed; answering in {0}us (P6 is {1}us)",
                 ActivationResponseTimeMicroseconds, Timings.P6.TotalMicroseconds);
 
-            timer.Schedule(TimeInterval.FromMicroseconds(ActivationResponseTimeMicroseconds), () =>
-            {
-                SetState(SWPState.Activated, SWPTransition.Activate);
-
-                var m = master;
-                if(m == null)
-                {
-                    this.Log(LogLevel.Error, "No master attached; cannot answer the ACTIVATE");
-                    return;
-                }
-                m.NotifySlaveActivated();
-                FlushPendingToMaster();
-            });
+            timer.Schedule(TimeInterval.FromMicroseconds(ActivationResponseTimeMicroseconds), AnswerActivation);
         }
 
-        public void OnDeactivate()
+        /// <summary>
+        /// The moment this end answers an ACTIVATE, reached
+        /// <see cref="ActivationResponseTimeMicroseconds"/> after the master
+        /// addressed it. This is where a proprietary part runs whatever it
+        /// really exchanges — ACT_SYNC, ACT_POWER_MODE, a bit-rate negotiation —
+        /// before declaring itself ready.
+        ///
+        /// Whatever an override does, it must reach
+        /// <c>Master.NotifySlaveActivated()</c> inside the master's P6 and P7 or
+        /// the master will fail the activation, which is the behaviour under
+        /// test. Delay by scheduling further steps on <see cref="Timer"/>; never
+        /// block here, this runs on the emulation thread.
+        /// </summary>
+        protected virtual void AnswerActivation()
+        {
+            SetState(SWPState.Activated, SWPTransition.Activate);
+
+            var m = master;
+            if(m == null)
+            {
+                this.Log(LogLevel.Error, "No master attached; cannot answer the ACTIVATE");
+                return;
+            }
+            m.NotifySlaveActivated();
+            FlushPendingToMaster();
+        }
+
+        public virtual void OnDeactivate()
         {
             timer.CancelAll();
             lock(pendingLock)
@@ -168,7 +191,7 @@ namespace Antmicro.Renode.Peripherals.SWP
             SetState(SWPState.Deactivated, SWPTransition.Deactivate);
         }
 
-        public void OnSuspend()
+        public virtual void OnSuspend()
         {
             timer.CancelAll();
             SetState(SWPState.Suspended, SWPTransition.Suspend);
@@ -178,7 +201,7 @@ namespace Antmicro.Renode.Peripherals.SWP
         /// The master's P2 idle bits have ended and the link is ACTIVATED. We
         /// answer with our transition sequence, which must land inside P3max.
         /// </summary>
-        public void OnResume()
+        public virtual void OnResume()
         {
             timer.CancelAll();
             SetState(SWPState.Activated, SWPTransition.Resume);
@@ -186,21 +209,31 @@ namespace Antmicro.Renode.Peripherals.SWP
             this.Log(LogLevel.Debug, "RESUME observed; answering in {0}us (P3max is {1}us)",
                 ResumeResponseTimeMicroseconds, Timings.P3.TotalMicroseconds);
 
-            timer.Schedule(TimeInterval.FromMicroseconds(ResumeResponseTimeMicroseconds), () =>
+            timer.Schedule(TimeInterval.FromMicroseconds(ResumeResponseTimeMicroseconds), AnswerResume);
+        }
+
+        /// <summary>
+        /// The moment this end answers a RESUME with its transition sequence,
+        /// reached <see cref="ResumeResponseTimeMicroseconds"/> after the
+        /// master's P2 idle bits ended. An override must reach
+        /// <c>Master.NotifySlaveResumed()</c> inside P3max, or the master
+        /// reports the miss — the link stays ACTIVATED either way, since the
+        /// master owns the state.
+        /// </summary>
+        protected virtual void AnswerResume()
+        {
+            var m = master;
+            if(m == null)
             {
-                var m = master;
-                if(m == null)
-                {
-                    this.Log(LogLevel.Error, "No master attached; cannot answer the RESUME");
-                    return;
-                }
-                m.NotifySlaveResumed();
-                FlushPendingToMaster();
-            });
+                this.Log(LogLevel.Error, "No master attached; cannot answer the RESUME");
+                return;
+            }
+            m.NotifySlaveResumed();
+            FlushPendingToMaster();
         }
 
         /// <summary>S1 voltage modulation, master -> slave. Opaque bytes.</summary>
-        public void ReceiveFromMaster(byte[] data)
+        public virtual void ReceiveFromMaster(byte[] data)
         {
             if(data == null || data.Length == 0)
             {
@@ -224,11 +257,6 @@ namespace Antmicro.Renode.Peripherals.SWP
 
             var handler = DataReceived;
             handler?.Invoke(data);
-
-            if(Loopback)
-            {
-                SendToMaster(data);
-            }
         }
 
         // ==============================================================
@@ -243,7 +271,7 @@ namespace Antmicro.Renode.Peripherals.SWP
         /// UICC does on the wire when it has something to say — and the data
         /// goes out once the link is back. On a DEACTIVATED link it is dropped.
         /// </summary>
-        public void SendToMaster(byte[] data)
+        public virtual void SendToMaster(byte[] data)
         {
             if(data == null || data.Length == 0)
             {
@@ -280,7 +308,12 @@ namespace Antmicro.Renode.Peripherals.SWP
             m.ReceiveFromSlave(data);
         }
 
-        private void FlushPendingToMaster()
+        /// <summary>
+        /// Drain what queued while the link was down. The base calls this after
+        /// answering an ACTIVATE or a RESUME; an override that replaces those
+        /// answers is responsible for calling it.
+        /// </summary>
+        protected void FlushPendingToMaster()
         {
             List<byte[]> bursts;
             lock(pendingLock)
@@ -309,6 +342,28 @@ namespace Antmicro.Renode.Peripherals.SWP
         // ==============================================================
         //  Monitor / test surface
         // ==============================================================
+
+        /// <summary>
+        /// <see cref="ISWPEndpoint.TransmitToPeer"/>: for the slave, the peer is
+        /// the master.
+        /// </summary>
+        public void TransmitToPeer(byte[] data) => SendToMaster(data);
+
+        /// <summary>
+        /// Ask the master for the bit clock back. On a SUSPENDED link this is
+        /// the S2 modulation a UICC uses to wake the CLF; in any other state the
+        /// master ignores it, which is its call to make.
+        /// </summary>
+        public virtual void RequestResumeFromMaster()
+        {
+            var m = master;
+            if(m == null)
+            {
+                this.Log(LogLevel.Warning, "Cannot request a RESUME: no master attached");
+                return;
+            }
+            m.RequestResume();
+        }
 
         /// <summary>`sysbus.uicc Send "6F 1A 84"` — modulate bytes back to the master.</summary>
         public void Send(string hexBytes)
@@ -374,7 +429,6 @@ namespace Antmicro.Renode.Peripherals.SWP
             builder.AppendFormat("timings:    {0}{1}", Timings, Environment.NewLine);
             builder.AppendFormat("answers:    activate in {0}us, resume in {1}us{2}",
                 ActivationResponseTimeMicroseconds, ResumeResponseTimeMicroseconds, Environment.NewLine);
-            builder.AppendFormat("loopback:   {0}{1}", Loopback, Environment.NewLine);
             builder.AppendFormat("bytes:      {0} -> master, {1} <- master, {2} dropped{3}",
                 BytesToMaster, BytesFromMaster, Overruns, Environment.NewLine);
             return builder.ToString();
@@ -384,7 +438,7 @@ namespace Antmicro.Renode.Peripherals.SWP
         public ulong BytesFromMaster { get; private set; }
         public ulong Overruns { get; private set; }
 
-        public void Reset()
+        public virtual void Reset()
         {
             timer.CancelAll();
             lock(pendingLock)
@@ -486,7 +540,13 @@ namespace Antmicro.Renode.Peripherals.SWP
         //  Internals
         // ==============================================================
 
-        private void SetState(SWPState next, SWPTransition transition)
+        /// <summary>
+        /// Move this end's view of the link and raise
+        /// <see cref="StateChanged"/>. The slave never *decides* a state — the
+        /// master does — so a subclass calls this to mirror what it observed,
+        /// not to drive the wire.
+        /// </summary>
+        protected virtual void SetState(SWPState next, SWPTransition transition)
         {
             var previous = state;
             state = next;
@@ -502,8 +562,15 @@ namespace Antmicro.Renode.Peripherals.SWP
             handler?.Invoke(new SWPStateChangedEventArgs(previous, next, transition));
         }
 
-        /// <summary>Exposed so a host can route the slave's delays onto its own sequencer.</summary>
+        /// <summary>Schedule virtual-time steps from an override. Never block.</summary>
         public SWPTimer Timer => timer;
+
+        /// <summary>
+        /// The master, once attached, for a subclass to answer on:
+        /// NotifySlaveActivated, NotifySlaveResumed, ReceiveFromSlave,
+        /// RequestResume. Null before the first ACTIVATE.
+        /// </summary>
+        protected ISWPMaster Master => master;
 
         protected readonly IMachine Machine;
 
@@ -518,6 +585,20 @@ namespace Antmicro.Renode.Peripherals.SWP
         private volatile SWPState state;
         private volatile ISWPMaster master;
         private volatile bool clientConnected;
+
+        /// <summary>
+        /// Sockets and threads do not serialize, so the field is dropped on
+        /// save and rebuilt on load — otherwise `Load state` would restore a
+        /// slave whose port silently no longer listens.
+        /// </summary>
+        [PostDeserialization]
+        private void AfterLoad()
+        {
+            if(port != 0)
+            {
+                StartSocket();
+            }
+        }
 
         [Transient]
         private SocketServerProvider socket;

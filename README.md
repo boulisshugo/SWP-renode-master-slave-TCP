@@ -29,7 +29,10 @@ peripherals/
   SWPController.cs            the master (CLF): owns the link and every
                               deadline; raw TCP socket for link data
   SWPSlave.cs                 the slave (UICC): passive on voltage, must answer
-                              inside P6/P7 and P3; optional TCP socket
+                              inside P6/P7 and P3; optional TCP socket. Designed
+                              to be subclassed — see integrate.md
+  SWPLoopbackSlave.cs         the smallest real subclass; a worked example and
+                              the regression test for derivation
   SWPRegisterInterface.cs     memory-mapped front-end so firmware can drive
                               either end of the link
   SWPChipEventController.cs   drives the link from ChipEventController opcodes
@@ -370,7 +373,7 @@ sequenceDiagram
         S->>S: BytesToMaster += 1
         S->>C: ReceiveFromSlave(bytes) — S2 current modulation
         C->>C: BytesFromSlave += n, note activity, re-arm P1
-        C->>C: raise DataFromSlave
+        C->>C: raise DataReceived
         alt a host client is connected
             C->>SK: Send(burst) — one write() per burst
             SK->>H: bytes appear on tcp://host:3460
@@ -404,7 +407,7 @@ flowchart TD
     L --> M["master.ReceiveFromSlave(bytes)"]
     M --> N{master still ACTIVATED?}
     N -->|no| O["discarded, logged"]
-    N -->|yes| P["DataFromSlave -> host socket"]
+    N -->|yes| P["DataReceived -> host socket"]
 ```
 
 ## ChipEventController integration
@@ -487,21 +490,67 @@ that does is length-delimited, above it.
 
 IRQ is asserted while `(RXNE && RXNEIE) || (LINKCH && LINKIE)`.
 
+## Building your own slave
+
+`SWPSlave` is a base class, not just a reference implementation. Everything the
+controller calls is `virtual`, and the seams a derivative needs are `protected`:
+`Master` to answer on, `Timer` to schedule on virtual time, `SetState` to mirror
+the link, `FlushPendingToMaster` to drain what queued while it was down. The two
+hooks most real parts replace are `AnswerActivation()` and `AnswerResume()` —
+the points where a part runs its own handshake — plus `ReceiveFromMaster()`.
+
+```csharp
+public class AcmeSecureElement : SWPSlave
+{
+    public AcmeSecureElement(IMachine machine, int port = 0, bool autoStart = true)
+        : base(machine, port, autoStart) { }
+
+    protected override void AnswerActivation()
+    {
+        // your ACT_SYNC / ACT_POWER_MODE exchange; the base still holds you to P6/P7
+        SetState(SWPState.Activated, SWPTransition.Activate);
+        Master?.NotifySlaveActivated();
+        FlushPendingToMaster();
+    }
+
+    public override void ReceiveFromMaster(byte[] data)
+    {
+        base.ReceiveFromMaster(data);
+        // your stack
+    }
+}
+```
+
+If your class already has a base class it must keep, implement `ISWPSlave`
+instead — the controller only ever talks to the interface, and `ISWPEndpoint` is
+wide enough that `SWPRegisterInterface` still works either way, so you keep the
+memory-mapped block for your firmware.
+
+One trap worth knowing before you start: the controller holds the slave as an
+`ISWPSlave` and calls through the interface, so a `new` method instead of an
+`override` compiles, reads correctly, and never runs. **[integrate.md](integrate.md)**
+covers this and the rest of the process in full.
+
 ## Tests
 
 ```bash
 RENODE_ROOT=~/renode ./run-tests.sh
 ```
 
-Two suites, 32 cases, all passing:
+Two suites, 35 cases, all passing:
 
-- `tests/swp.robot` (25) — every state, every transition, each timing boundary
+- `tests/swp.robot` (28) — every state, every transition, each timing boundary
   (P5 before the slave is addressed, P6/P7 activation failure, the end of the
   P2 idle bits, P3max, P4 before deactivation takes effect), the full-duplex
   byte path, payload transparency, and runtime reconfiguration of the timings.
 - `tests/nucleo_h533re_swp.robot` (7) — the example end to end: firmware boot,
   link state visible through the register block, a framed request answered, and
   the ChipEventController opcodes.
+
+Three of those cases exist specifically to protect derivation: an override is
+actually called through the controller, the base class does *not* do the same
+thing on its own, and a slave reached only through `ISWPSlave` still drives the
+register block.
 
 Every timing assertion advances virtual time with `emulation RunFor`, never a
 host sleep, so the suite is deterministic and replayable.

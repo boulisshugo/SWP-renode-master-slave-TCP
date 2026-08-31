@@ -19,6 +19,7 @@ using System.Text;
 using System.Threading;
 
 using Antmicro.Migrant;
+using Antmicro.Migrant.Hooks;
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure;
 using Antmicro.Renode.Exceptions;
@@ -41,6 +42,7 @@ namespace Antmicro.Renode.Peripherals.SWP
     public class SWPController :
         NullRegistrationPointPeripheralContainer<ISWPSlave>,
         ISWPMaster,
+        ISWPLinkControl,
         IDisposable
     {
         /// <param name="port">
@@ -116,8 +118,12 @@ namespace Antmicro.Renode.Peripherals.SWP
         /// <summary>Raised when the slave misses P3 during RESUME.</summary>
         public event Action ResumeTimedOut;
 
-        /// <summary>Raised for every burst modulated back by the slave, before it reaches the socket.</summary>
-        public event Action<byte[]> DataFromSlave;
+        /// <summary>
+        /// Raised for every burst modulated back by the slave, before it reaches
+        /// the socket. Named for <see cref="ISWPEndpoint"/> rather than for the
+        /// direction, so one consumer can bind either end of the link.
+        /// </summary>
+        public event Action<byte[]> DataReceived;
 
         // ==============================================================
         //  Transitions
@@ -367,7 +373,7 @@ namespace Antmicro.Renode.Peripherals.SWP
 
             this.Log(LogLevel.Noisy, "S2 slave -> master: {0}", SWPBytes.Hex(data));
 
-            var handler = DataFromSlave;
+            var handler = DataReceived;
             handler?.Invoke(data);
 
             TransmitToHost(data);
@@ -420,6 +426,12 @@ namespace Antmicro.Renode.Peripherals.SWP
 
             DeliverToSlave(data);
         }
+
+        /// <summary>
+        /// <see cref="ISWPEndpoint.TransmitToPeer"/>: for the master, the peer is
+        /// the slave.
+        /// </summary>
+        public void TransmitToPeer(byte[] data) => SendToSlave(data);
 
         /// <summary>`sysbus.swp Transmit "00 A4 04 00"` — inject master -> slave data by hand.</summary>
         public void Transmit(string hexBytes)
@@ -801,6 +813,20 @@ namespace Antmicro.Renode.Peripherals.SWP
         private volatile ISWPSlave attachedSlave;
 
         private long activityCounter;
+
+        /// <summary>
+        /// Sockets and threads do not serialize, so the field is dropped on save
+        /// and rebuilt on load — otherwise `Load state` would restore a
+        /// controller whose port silently no longer listens.
+        /// </summary>
+        [PostDeserialization]
+        private void AfterLoad()
+        {
+            if(port != 0)
+            {
+                StartSocket();
+            }
+        }
 
         [Transient]
         private SocketServerProvider socket;

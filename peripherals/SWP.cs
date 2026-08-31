@@ -162,12 +162,44 @@ namespace Antmicro.Renode.Peripherals.SWP
     // ==================================================================
 
     /// <summary>
-    /// Anything sitting on an SWP link. Both ends expose their view of the
-    /// link state; they agree once a transition has settled.
+    /// One end of an SWP link, as anything above the link sees it — a
+    /// memory-mapped register block, a Robot test, a bridge to somewhere else.
+    ///
+    /// This is deliberately the whole surface such a consumer needs, so that a
+    /// proprietary endpoint implementing these members works with
+    /// <see cref="SWPRegisterInterface"/> and everything else in this repo
+    /// without deriving from the shipped classes.
     /// </summary>
     public interface ISWPEndpoint : IPeripheral
     {
+        /// <summary>This end's view of the link. Both ends agree once a transition settles.</summary>
         SWPState State { get; }
+
+        /// <summary>Every burst arriving from the other end, raw and uninterpreted.</summary>
+        event Action<byte[]> DataReceived;
+
+        /// <summary>Raised on the emulation thread when this end observes a new link state.</summary>
+        event Action<SWPStateChangedEventArgs> StateChanged;
+
+        /// <summary>
+        /// Send raw bytes towards the other end. Named for the direction rather
+        /// than the role so one consumer can drive either end; each class
+        /// forwards it to its own SendToSlave / SendToMaster.
+        /// </summary>
+        void TransmitToPeer(byte[] data);
+    }
+
+    /// <summary>
+    /// The extra verbs only the master has. The slave is passive on voltage, so
+    /// it can never drive a transition — which is why these are not on
+    /// <see cref="ISWPEndpoint"/>.
+    /// </summary>
+    public interface ISWPLinkControl : ISWPEndpoint
+    {
+        void Activate();
+        void Deactivate();
+        void Suspend();
+        void Resume();
     }
 
     /// <summary>
@@ -216,6 +248,14 @@ namespace Antmicro.Renode.Peripherals.SWP
 
         /// <summary>S1 voltage modulation: raw bytes master -> slave. Never framed.</summary>
         void ReceiveFromMaster(byte[] data);
+
+        /// <summary>
+        /// Ask the master for the bit clock back — on the wire, modulating S2
+        /// while the link is SUSPENDED. Exposed so a register front-end above
+        /// the slave can offer firmware a RESUME verb without reaching for the
+        /// master itself.
+        /// </summary>
+        void RequestResumeFromMaster();
     }
 
     // ==================================================================

@@ -11,6 +11,10 @@
 // SWPMI, a master interface; the register layout here is deliberately its own
 // simple thing rather than a claim to be register-compatible with any vendor IP.
 //
+// It binds to ISWPLinkControl / ISWPSlave, never to the shipped classes, so a
+// proprietary slave keeps this block whether it derives from SWPSlave or
+// implements ISWPSlave from scratch.
+//
 // Still no protocol layer. TDR takes a byte and puts it on the wire; RDR hands
 // back a byte that came off it. Framing — SOF/EOF, CRC, bit stuffing, HCI — is
 // the firmware's business at this end and the host client's at the other.
@@ -49,14 +53,18 @@ namespace Antmicro.Renode.Peripherals.SWP
     public class SWPRegisterInterface : IDoubleWordPeripheral, IKnownSize
     {
         /// <param name="controller">Front the master end. Mutually exclusive with <paramref name="slave"/>.</param>
-        /// <param name="slave">Front the slave end. Mutually exclusive with <paramref name="controller"/>.</param>
+        /// <param name="slave">
+        /// Front the slave end. Mutually exclusive with <paramref name="controller"/>.
+        /// Any ISWPSlave will do — SWPSlave, a subclass of it, or your own
+        /// implementation.
+        /// </param>
         /// <param name="rxFifoDepth">Bytes buffered before OVR is raised.</param>
         /// <remarks>
         /// The <paramref name="machine"/> parameter is unused but kept: Renode
         /// fills it in automatically when a peripheral is declared in a .repl,
         /// and dropping it would change how this one has to be written there.
         /// </remarks>
-        public SWPRegisterInterface(IMachine machine, SWPController controller = null, SWPSlave slave = null,
+        public SWPRegisterInterface(IMachine machine, ISWPLinkControl controller = null, ISWPSlave slave = null,
             int rxFifoDepth = 256)
         {
             if((controller == null) == (slave == null))
@@ -67,18 +75,13 @@ namespace Antmicro.Renode.Peripherals.SWP
 
             this.controller = controller;
             this.slave = slave;
+            this.endpoint = (ISWPEndpoint)controller ?? slave;
             this.rxFifoDepth = Math.Max(1, rxFifoDepth);
 
-            if(controller != null)
-            {
-                controller.DataFromSlave += OnBytesReceived;
-                controller.StateChanged += OnLinkStateChanged;
-            }
-            else
-            {
-                slave.DataReceived += OnBytesReceived;
-                slave.StateChanged += OnLinkStateChanged;
-            }
+            // Both directions look the same from up here, which is the point of
+            // ISWPEndpoint: one register block, either end of the link.
+            endpoint.DataReceived += OnBytesReceived;
+            endpoint.StateChanged += OnLinkStateChanged;
 
             registers = BuildRegisters();
         }
@@ -165,7 +168,7 @@ namespace Antmicro.Renode.Peripherals.SWP
 
         // --- link plumbing --------------------------------------------------------
 
-        private SWPState CurrentState => controller != null ? controller.State : slave.State;
+        private SWPState CurrentState => endpoint.State;
 
         private void RequestTransition(SWPTransition transition)
         {
@@ -178,8 +181,8 @@ namespace Antmicro.Renode.Peripherals.SWP
                 // the wire is a current modulation while SUSPENDED.
                 if(transition == SWPTransition.Resume)
                 {
-                    slave.SendToMaster(new byte[0]);
                     this.Log(LogLevel.Debug, "Slave end: forwarding the resume request to the master");
+                    slave.RequestResumeFromMaster();
                 }
                 else
                 {
@@ -201,15 +204,7 @@ namespace Antmicro.Renode.Peripherals.SWP
 
         private void Transmit(byte value)
         {
-            var data = new byte[] { value };
-            if(controller != null)
-            {
-                controller.SendToSlave(data);
-            }
-            else
-            {
-                slave.SendToMaster(data);
-            }
+            endpoint.TransmitToPeer(new byte[] { value });
         }
 
         /// <summary>Runs on the emulation thread, from the link's data event.</summary>
@@ -284,8 +279,9 @@ namespace Antmicro.Renode.Peripherals.SWP
             ReceiveLevel = 0x10,
         }
 
-        private readonly SWPController controller;
-        private readonly SWPSlave slave;
+        private readonly ISWPLinkControl controller;
+        private readonly ISWPSlave slave;
+        private readonly ISWPEndpoint endpoint;
         private readonly int rxFifoDepth;
         private readonly Queue<byte> rxFifo = new Queue<byte>();
         private readonly object fifoLock = new object();

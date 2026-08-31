@@ -33,16 +33,18 @@ Load SWP Sources
     Execute Command         include @${REPO}/peripherals/SWP.cs
     Execute Command         include @${REPO}/peripherals/SWPController.cs
     Execute Command         include @${REPO}/peripherals/SWPSlave.cs
+    Execute Command         include @${REPO}/peripherals/SWPLoopbackSlave.cs
 
 Create SWP Machine
     [Documentation]         A bare link with no CPU: the peripherals are
     ...                     independent of any platform, which is the point.
     [Arguments]             ${port}=0  ${slave_activate_us}=200  ${slave_resume_us}=50
+    ...                     ${slave_type}=SWP.SWPSlave
     Create Log Tester       5
     Execute Command         mach create "board"
     Load SWP Sources
     Execute Command         machine LoadPlatformDescriptionFromString "swp: SWP.SWPController @ sysbus { port: ${port}; P1: ${P1}; P2: ${P2}; P3: ${P3}; P4: ${P4}; P5: ${P5}; P6: ${P6}; P7: ${P7} }"
-    Execute Command         machine LoadPlatformDescriptionFromString "uicc: SWP.SWPSlave @ swp { P1: ${P1}; P2: ${P2}; P3: ${P3}; P4: ${P4}; P5: ${P5}; P6: ${P6}; P7: ${P7} }"
+    Execute Command         machine LoadPlatformDescriptionFromString "uicc: ${slave_type} @ swp { P1: ${P1}; P2: ${P2}; P3: ${P3}; P4: ${P4}; P5: ${P5}; P6: ${P6}; P7: ${P7} }"
     # Monitor arguments are passed verbatim, so anything arithmetic has to be
     # reduced to a number on this side first.
     ${activate_us}=         Evaluate  int(${slave_activate_us})
@@ -350,9 +352,10 @@ Transmitting On A Deactivated Link Drops The Data
     Should Be True          ${dropped.strip()} > 0
 
 Loopback Returns A Full Round Trip
-    Create SWP Machine
+    [Documentation]         SWPLoopbackSlave is a real subclass of SWPSlave, so
+    ...                     this also proves derivation works end to end.
+    Create SWP Machine      slave_type=SWP.SWPLoopbackSlave
     Execute Command         sysbus.swp AutoSuspend false
-    Execute Command         sysbus.swp.uicc Loopback true
     Bring Link Up
 
     Execute Command         sysbus.swp Transmit "DE AD BE EF"
@@ -397,3 +400,65 @@ Controller Opens Its TCP Port
     Create SWP Machine      port=${LINK_PORT}
     ${status}=              Execute Command  sysbus.swp Status
     Should Contain          ${status}  ${LINK_PORT}
+
+Subclass Overrides Are Called Through The Controller
+    [Documentation]         The controller holds the slave as an ISWPSlave and
+    ...                     calls through the interface. Before SWPSlave's
+    ...                     methods were virtual, a subclass could only hide them
+    ...                     with `new` — which compiles, reads correctly, and
+    ...                     never runs. SWPLoopbackSlave overrides
+    ...                     ReceiveFromMaster and does nothing else, so bytes
+    ...                     coming back at all is the proof the override binds.
+    Create SWP Machine      slave_type=SWP.SWPLoopbackSlave
+    Execute Command         sysbus.swp AutoSuspend false
+    Bring Link Up
+
+    ${before}=              Execute Command  sysbus.swp BytesFromSlave
+    Should Be Equal As Integers  ${before.strip()}  0
+
+    Execute Command         sysbus.swp Transmit "C0 FF EE"
+    Run For Microseconds    2000
+
+    ${after}=               Execute Command  sysbus.swp BytesFromSlave
+    Should Be Equal As Integers  ${after.strip()}  3
+
+Base Slave Does Not Echo
+    [Documentation]         The counterpart: with the plain base class the same
+    ...                     traffic produces no answer, so the test above is
+    ...                     measuring the override and not something the base
+    ...                     was doing anyway.
+    Create SWP Machine
+    Execute Command         sysbus.swp AutoSuspend false
+    Bring Link Up
+
+    Execute Command         sysbus.swp Transmit "C0 FF EE"
+    Run For Microseconds    2000
+
+    ${back}=                Execute Command  sysbus.swp BytesFromSlave
+    Should Be Equal As Integers  ${back.strip()}  0
+
+A From-Scratch Endpoint Still Drives The Register Block
+    [Documentation]         SWPRegisterInterface binds to ISWPSlave, not to the
+    ...                     shipped class, so a proprietary slave keeps the
+    ...                     memory-mapped front-end. Checked here against a
+    ...                     subclass, which reaches the block by the same
+    ...                     interface an independent implementation would.
+    Create SWP Machine      slave_type=SWP.SWPLoopbackSlave
+    Execute Command         include @${REPO}/peripherals/SWPRegisterInterface.cs
+    Execute Command         machine LoadPlatformDescriptionFromString "swpmi: SWP.SWPRegisterInterface @ sysbus 0x40008800 { slave: uicc }"
+    Execute Command         sysbus.swp AutoSuspend false
+    Bring Link Up
+
+    # The block is at 0x40008800: SR at +0x04, RXLEVEL at +0x10.
+    # The Monitor returns "0x...", which Evaluate substitutes as a Python int
+    # literal — so no int() conversion, and none of base 16 either.
+    ${sr}=                  Execute Command  sysbus ReadDoubleWord 0x40008804
+    ${state}=               Evaluate  ${sr.strip()} & 3
+    Should Be Equal As Integers  ${state}  2
+
+    Execute Command         sysbus.swp Transmit "5A"
+    Run For Microseconds    2000
+
+    # The burst reached the FIFO through ISWPEndpoint.DataReceived.
+    ${level}=               Execute Command  sysbus ReadDoubleWord 0x40008810
+    Should Be True          ${level.strip()} > 0
