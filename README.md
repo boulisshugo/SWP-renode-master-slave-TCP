@@ -105,6 +105,308 @@ the normative table in clause 8, and it is paywalled. Set the properties from
 your copy of the spec for a timing-exact model; nothing in the logic assumes
 the shipped numbers.
 
+## How the link behaves
+
+Every diagram below is the shipped behaviour, not an idealisation of it: the
+branches, the drops and the deadline names all correspond to code in
+`peripherals/`.
+
+### Who talks to whom
+
+```mermaid
+flowchart LR
+    subgraph host["Host"]
+        JC["TCP client<br/><i>builds and parses frames</i>"]
+    end
+
+    subgraph renode["Renode"]
+        CE["SWPChipEventController<br/>0x07 / 0x08"]
+        subgraph link["the SWP link — carries opaque bytes only"]
+            CTRL["SWPController<br/>master / CLF"]
+            SLV["SWPSlave<br/>slave / UICC"]
+        end
+        REG["SWPRegisterInterface<br/>CR SR TDR RDR"]
+        FW["Firmware on the CPU<br/><i>builds and parses frames</i>"]
+    end
+
+    JC -->|"link events, port 3456"| CE
+    CE -->|"ACTIVATE / DEACTIVATE"| CTRL
+    JC <-->|"raw link data, port 3460"| CTRL
+    CTRL <-->|"S1 voltage out, S2 current back"| SLV
+    SLV <--> REG
+    REG <-->|"memory-mapped"| FW
+```
+
+The two things that build and parse frames sit at the far ends. Everything
+between them moves bytes it never looks at.
+
+### State transitions
+
+```mermaid
+stateDiagram-v2
+    [*] --> DEACTIVATED
+
+    DEACTIVATED --> ACTIVATED : ACTIVATE — P5 settling,<br/>slave answers inside P6 and P7
+    DEACTIVATED --> DEACTIVATED : ACTIVATE fails — P6 or P7 expired<br/>RESUME refused — no bit clock to restart
+
+    ACTIVATED --> SUSPENDED : SUSPEND — explicit,<br/>or P1 of nothing but idle bits
+    SUSPENDED --> ACTIVATED : RESUME — at the end of the<br/>P2 idle bits (P3max only checks the slave's answer)
+
+    ACTIVATED --> DEACTIVATED : DEACTIVATE — SWIO held low for P4
+    SUSPENDED --> DEACTIVATED : DEACTIVATE — SWIO held low for P4
+
+    note left of DEACTIVATED
+        S1 constantly low.
+        No traffic either way.
+    end note
+
+    note right of SUSPENDED
+        S1 constantly high.
+        Link alive, no bit clock.
+        Data on either side resumes it.
+    end note
+
+    note right of ACTIVATED
+        Bit clock on S1.
+        Full duplex: voltage out,
+        current modulation back.
+    end note
+```
+
+The master is the only side that decides the state. The slave mirrors what it
+observes and has no vote — which is the wire's own arrangement, since it never
+drives voltage.
+
+### ACTIVATE
+
+`DEACTIVATED` to `ACTIVATED`. P5, P6 and P7 are armed as **concurrent
+deadlines**, not a sequence: P7 runs from t0 so an unusually long P5 cannot
+hide a slave that never answers, and whichever of P6 and P7 expires first fails
+the sequence.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant H as Host client
+    participant C as SWPController (CLF)
+    participant S as SWPSlave (UICC)
+
+    Note over C: state = DEACTIVATED, S1 held low
+    H->>C: ACTIVATE
+    C->>C: arm P7 (whole-sequence budget, from t0)
+    C->>C: arm P5 (line settling)
+
+    Note over C,S: t0 + P5 : line settled
+    C->>S: OnActivate()
+    C->>C: arm P6 (slave answer deadline)
+
+    alt slave answers inside P6 and P7
+        S->>S: wait ActivationResponseTime
+        S->>S: state = ACTIVATED
+        S-->>C: NotifySlaveActivated()
+        C->>C: cancel P5/P6/P7
+        C->>C: state = ACTIVATED, arm P1 idle watch
+        C-->>H: acknowledged, link is up
+    else P6 or P7 expires first
+        C->>S: OnDeactivate()
+        C->>C: state = DEACTIVATED
+        C-->>H: ActivationFailed
+    end
+```
+
+Two shortcuts the controller takes, both logged: `Activate()` on an already
+`SUSPENDED` link is treated as a `RESUME`, and `Activate()` with no slave
+registered fails immediately rather than waiting out P7.
+
+### DEACTIVATE
+
+Any state to `DEACTIVATED`. The master holds SWIO low; only after P4 is the
+link observably down and the slave told.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant H as Host client
+    participant C as SWPController (CLF)
+    participant S as SWPSlave (UICC)
+
+    Note over C: state = ACTIVATED or SUSPENDED
+    H->>C: DEACTIVATE
+    C->>C: cancel every armed deadline
+    C->>C: cancel the P1 idle watch
+    C->>C: hold SWIO low, arm P4
+
+    Note over C,S: t0 + P4 : held low long enough
+    C->>S: OnDeactivate()
+    S->>S: drop queued data, state = DEACTIVATED
+    C->>C: state = DEACTIVATED
+    C-->>H: acknowledged, link is down
+```
+
+### SUSPEND and RESUME
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as SWPController (CLF)
+    participant S as SWPSlave (UICC)
+
+    Note over C,S: SUSPEND — the master stops the bit clock
+
+    alt automatic, after P1 of idle bits
+        C->>C: P1 idle watch fires, no activity since it was armed
+    else explicit
+        Note over C: Suspend() from the Monitor, CR.SUSPEND or a host client
+    end
+    C->>S: OnSuspend()
+    C->>C: state = SUSPENDED, S1 held high
+    S->>S: state = SUSPENDED
+
+    Note over C,S: RESUME — the master restarts it
+
+    alt master-initiated
+        Note over C: Resume(), or data to transmit while SUSPENDED
+    else slave-initiated
+        S->>C: RequestResume() — S2 modulation while suspended
+    end
+    C->>C: send transition sequence, arm P2
+
+    Note over C,S: end of the last P2 idle bit
+    C->>C: state = ACTIVATED, arm P3 and the P1 idle watch
+    C->>S: OnResume()
+    S->>S: state = ACTIVATED
+
+    alt slave answers inside P3max
+        S-->>C: NotifySlaveResumed()
+        Note over C: transition sequence received, link healthy
+    else P3max expires first
+        C->>C: raise ResumeTimedOut
+        Note over C: link stays ACTIVATED — the master owns the state,<br/>but the missed deadline is reported
+    end
+```
+
+Note where the state actually changes on a resume: at the **end of the last P2
+idle bit**, whether or not the slave has answered yet. P3max governs the
+slave's transition sequence, and missing it is reported rather than fatal —
+the master owns the link state either way.
+
+### A message travelling master to slave
+
+The host client writes raw bytes; the firmware reads them out of `RDR`. Nothing
+in between inspects a byte.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant H as Host TCP client
+    participant SK as Socket reader thread
+    participant C as SWPController (CLF)
+    participant S as SWPSlave (UICC)
+    participant R as SWPRegisterInterface
+    participant F as Firmware
+
+    H->>SK: write raw bytes to tcp://host:3460
+    Note over SK: DataBlockReceived, off the emulation thread
+    SK->>SK: copy the buffer (the provider reuses its own)
+    SK->>C: HandleTimeDomainEvent(SendToSlave)
+
+    Note over C: now on the emulation thread
+    C->>C: charge transmission time at BitRate
+    C->>S: ReceiveFromMaster(bytes)
+    S->>S: BytesFromMaster += n, record burst
+    S->>R: DataReceived event
+    R->>R: push into the RX FIFO, raise RXNE
+    R-->>F: IRQ, if RXNEIE is set
+    F->>R: read RDR until RXLEVEL is 0
+    Note over F: the firmware parses its own frames here —<br/>nothing below this line inspected a single byte
+```
+
+The branch logic behind that happy path:
+
+```mermaid
+flowchart TD
+    A["SendToSlave(bytes)"] --> B{link state?}
+
+    B -->|DEACTIVATED| C["drop, Overruns++<br/>no wire to put them on"]
+
+    B -->|SUSPENDED| D{AutoResumeOnTransmit?}
+    D -->|no| E["drop, Overruns++"]
+    D -->|yes| F["queue in pendingToSlave"]
+    F --> G["Resume()"]
+    G --> H["end of P2 idle bits:<br/>state = ACTIVATED"]
+    H --> I["FlushPendingToSlave()"]
+
+    B -->|ACTIVATED| J["DeliverToSlave(bytes)"]
+    I --> J
+
+    J --> K{slave registered?}
+    K -->|no| L["drop, Overruns++"]
+    K -->|yes| M["BytesToSlave += n<br/>note activity, re-arm P1"]
+    M --> N["schedule delivery after<br/>transmission time at BitRate"]
+    N --> O{still ACTIVATED<br/>when it lands?}
+    O -->|no| P["burst lost, logged"]
+    O -->|yes| Q["slave.ReceiveFromMaster(bytes)"]
+```
+
+### A message travelling slave to master
+
+Full duplex, so this path is independent of the one above and neither waits on
+the other.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant F as Firmware
+    participant R as SWPRegisterInterface
+    participant S as SWPSlave (UICC)
+    participant C as SWPController (CLF)
+    participant SK as Socket writer thread
+    participant H as Host TCP client
+
+    Note over F: the firmware builds its own frame
+    loop one byte per TDR write
+        F->>R: write TDR
+        R->>S: SendToMaster(single byte)
+        S->>S: BytesToMaster += 1
+        S->>C: ReceiveFromSlave(bytes) — S2 current modulation
+        C->>C: BytesFromSlave += n, note activity, re-arm P1
+        C->>C: raise DataFromSlave
+        alt a host client is connected
+            C->>SK: Send(burst) — one write() per burst
+            SK->>H: bytes appear on tcp://host:3460
+        else nobody attached
+            C->>C: drop, Overruns++
+        end
+    end
+    Note over R,C: the register front-end sends a byte at a time, so each is<br/>its own burst. SendToMaster called with a larger array —<br/>from the Monitor, or the slave's own socket — sends it whole.
+```
+
+And its branch logic, including the slave-initiated resume — on the wire, the
+UICC modulating S2 while suspended to ask for the bit clock back:
+
+```mermaid
+flowchart TD
+    A["SendToMaster(bytes)"] --> B{master attached?}
+    B -->|no| C["drop, Overruns++"]
+    B -->|yes| D{link state?}
+
+    D -->|DEACTIVATED| E["drop, Overruns++"]
+
+    D -->|SUSPENDED| F["queue in pendingToMaster"]
+    F --> G["master.RequestResume()<br/>S2 modulation asks for the bit clock back"]
+    G --> H{master in SUSPENDED?}
+    H -->|no| I["ignored — the master owns the state"]
+    H -->|yes| J["Resume(): P2 idle bits, then ACTIVATED"]
+    J --> K["OnResume() -> FlushPendingToMaster()"]
+
+    D -->|ACTIVATED| L["BytesToMaster += n"]
+    K --> L
+    L --> M["master.ReceiveFromSlave(bytes)"]
+    M --> N{master still ACTIVATED?}
+    N -->|no| O["discarded, logged"]
+    N -->|yes| P["DataFromSlave -> host socket"]
+```
+
 ## ChipEventController integration
 
 `SWPChipEventController` maps the existing stimulus opcodes onto the link:
